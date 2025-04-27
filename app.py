@@ -1,101 +1,120 @@
 import streamlit as st
-import wikipediaapi
 import requests
-from bs4 import BeautifulSoup
+import base64
 import pandas as pd
 import matplotlib.pyplot as plt
+from bs4 import BeautifulSoup
+import os
 import plotly.express as px
 from collections import Counter
 from wordcloud import WordCloud
 from textblob import TextBlob
 
-# Inicializar el objeto WikipediaAPI con un User-Agent personalizado
-wiki_wiki = wikipediaapi.Wikipedia(
-    language='en',
-    user_agent='album-searcher'
-)
+# Obtener client_id y client_secret desde las variables de entorno
+client_id = os.getenv("SPOTIFY_CLIENT_ID")
+client_secret = os.getenv("SPOTIFY_CLIENT_SECRET")
 
-# Función para obtener la URL de la discografía de un artista
-def get_discography_url(artist_name):
-    artist_name = artist_name.strip().replace(" ", "_")
-    url = f"https://en.wikipedia.org/wiki/{artist_name}_discography"
-    return url
+if not client_id or not client_secret:
+    raise ValueError("No se pudo encontrar client_id o client_secret en las variables de entorno.")
 
-# Función para obtener los álbumes de estudio
-def get_studio_albums(url):
-    response = requests.get(url)
-    soup = BeautifulSoup(response.text, 'html.parser')
+# Función para obtener el token de Spotify
+def get_spotify_token(client_id, client_secret):
+    auth_string = f"{client_id}:{client_secret}"
+    b64_auth_string = base64.b64encode(auth_string.encode('utf-8')).decode('utf-8')
+    
+    headers = {
+        "Authorization": f"Basic {b64_auth_string}",
+        "Content-Type": "application/x-www-form-urlencoded"
+    }
 
-    studio_albums_section = soup.find('th', class_='navbox-group', string='Studio albums')
+    data = {
+        "grant_type": "client_credentials"
+    }
 
-    if studio_albums_section:
-        albums_list = studio_albums_section.find_next('ul')
-        albums = []
-        for item in albums_list.find_all('li'):
-            album_name = item.find('i').text if item.find('i') else item.text
-            album_link = "https://en.wikipedia.org" + item.find('a')['href'] if item.find('a') else ''
-            albums.append({'Title': album_name, 'Link': album_link})
+    response = requests.post("https://accounts.spotify.com/api/token", headers=headers, data=data)
+    token = response.json().get('access_token')
+    return token
 
-        df_studio_albums = pd.DataFrame(albums)
-        return df_studio_albums
-    else:
-        return None
+# Función para obtener los álbumes de un artista desde Spotify
+def get_spotify_albums(artist_name, token):
+    headers = {
+        "Authorization": f"Bearer {token}"
+    }
+    
+    search_url = f"https://api.spotify.com/v1/search?q={artist_name}&type=artist&limit=1"
+    response = requests.get(search_url, headers=headers)
+    artist_data = response.json()
+    artist_id = artist_data['artists']['items'][0]['id']
+    
+    albums_url = f"https://api.spotify.com/v1/artists/{artist_id}/albums?include_groups=album&limit=50"
+    response = requests.get(albums_url, headers=headers)
+    albums_data = response.json()
+    
+    albums = []
+    for album in albums_data['items']:
+        albums.append({'name': album['name'], 'release_date': album['release_date'], 'id': album['id']})
+    
+    return albums
 
 # Función para obtener las canciones de un álbum
-def get_album_songs(album_url):
-    response = requests.get(album_url)
-    soup = BeautifulSoup(response.text, 'html.parser')
+def get_album_tracks(album_id, token):
+    headers = {
+        "Authorization": f"Bearer {token}"
+    }
+    
+    tracks_url = f"https://api.spotify.com/v1/albums/{album_id}/tracks"
+    response = requests.get(tracks_url, headers=headers)
+    tracks_data = response.json()
+    
+    tracks = []
+    for track in tracks_data['items']:
+        tracks.append({'name': track['name'], 'track_number': track['track_number']})
+    
+    return tracks
 
-    # Intentar extraer las canciones de las tablas o listas del álbum
-    songs = []
-    # Buscar las listas o tablas de canciones en la página del álbum
-    song_table = soup.find('table', {'class': 'tracklist'})
+# Función para obtener los álbumes de estudio desde Wikipedia
+def get_studio_albums_from_wikipedia(artist_name):
+    search_url = f"https://en.wikipedia.org/w/api.php?action=query&format=json&list=search&srsearch={artist_name} discography"
+    response = requests.get(search_url)
+    data = response.json()
+    
+    if 'query' in data:
+        page_title = data['query']['search'][0]['title']
+        wikipedia_url = f"https://en.wikipedia.org/wiki/{page_title}"
+        response = requests.get(wikipedia_url)
+        soup = BeautifulSoup(response.text, 'html.parser')
+        
+        studio_albums_section = soup.find('th', class_='navbox-group', string='Studio albums')
+        
+        if studio_albums_section:
+            albums_list = studio_albums_section.find_next('ul')
+            albums = []
+            for item in albums_list.find_all('li'):
+                album_name = item.find('i').text if item.find('i') else item.text
+                album_link = "https://en.wikipedia.org" + item.find('a')['href'] if item.find('a') else ''
+                albums.append({'Title': album_name, 'Link': album_link})
+            return albums
+    return []
 
-    if song_table:
-        rows = song_table.find_all('tr')
-        for row in rows:
-            song = row.find('td')
-            if song:
-                song_name = song.get_text(strip=True)
-                songs.append(song_name)
-
-    # Si no hay canciones en formato tabla, intentamos en listas de enlaces
-    if not songs:
-        song_list = soup.find_all('ul')
-        for ul in song_list:
-            for li in ul.find_all('li'):
-                song_name = li.get_text(strip=True)
-                if song_name:
-                    songs.append(song_name)
-
-    return songs
-
-# Función para buscar bandas en Wikipedia usando wikipedia-api
-def search_bands(query):
-    page = wiki_wiki.page(query)
-    return page
-
-# Función para obtener la letra de una canción
-def get_song_lyrics(song_name, artist_name):
-    url = f"https://api.lyrics.ovh/v1/{artist_name}/{song_name}"
+# Función para obtener las letras de las canciones
+def get_lyrics(song_title):
+    url = f"https://api.lyrics.ovh/v1/{artist_name}/{song_title}"
     response = requests.get(url)
-
-    # Verificar si la respuesta fue exitosa
+    
     if response.status_code == 200:
-        try:
-            data = response.json()
-            # Verificar si se encontró la letra
-            if 'lyrics' in data:
-                return data['lyrics']
-            else:
-                st.error(f"No se encontraron letras para la canción: {song_name}")
-                return None
-        except ValueError:
-            st.error("Hubo un error al procesar la respuesta de la API.")
-            return None
+        data = response.json()
+        return data.get('lyrics', 'No lyrics found')
     else:
-        st.error(f"No se pudo obtener la letra de la canción: {song_name}. Código de respuesta: {response.status_code}")
-        return None
+        return 'No lyrics found'
+    
+# Visualización de la frecuencia de palabras
+def plot_word_frequency(word_freq):
+    most_common_words = word_freq.most_common(10)
+    words, counts = zip(*most_common_words)
+
+    fig = px.bar(x=words, y=counts, labels={'x': 'Word', 'y': 'Frequency'},
+                 title="Most Frequent Words in Lyrics")
+    st.plotly_chart(fig)
 
 # Análisis de las letras: Longitud de las canciones y frecuencia de palabras
 def analyze_lyrics(lyrics):
@@ -113,15 +132,6 @@ def plot_wordcloud(word_freq):
     plt.axis('off')
     st.pyplot(plt)
 
-# Visualización de la frecuencia de palabras
-def plot_word_frequency(word_freq):
-    most_common_words = word_freq.most_common(20)
-    words, counts = zip(*most_common_words)
-
-    fig = px.bar(x=words, y=counts, labels={'x': 'Word', 'y': 'Frequency'},
-                 title="Most Frequent Words in Lyrics")
-    st.plotly_chart(fig)
-
 # Visualización de análisis de sentimiento de la letra de la canción
 def plot_sentiment(lyrics):
     blob = TextBlob(lyrics)
@@ -137,65 +147,55 @@ def plot_sentiment(lyrics):
     ax.set_title(f'Sentiment: {sentiment_label}')
     st.pyplot(fig)
 
-# Configuración de la aplicación
-st.title('Explorador de Discografías de Artistas')
+# Aplicación Streamlit
+st.title("Explorador de Discografía de Artistas y Letras de Canciones")
 
-# Paso 1: Entrada de búsqueda
-query = st.text_input("Escribe el nombre de un artista o banda:")
+# Inputs del usuario
+artist_name = st.text_input("Introduce el nombre del artista o banda:")
 
-if query:
-    # Paso 2: Buscar artistas relacionados
-    result = search_bands(query)
+if artist_name:
+    token = get_spotify_token(client_id, client_secret)
+    
+    # Obtener los álbumes de Spotify
+    albums = get_spotify_albums(artist_name, token)
+    
+    # Obtener los álbumes de estudio desde Wikipedia
+    wikipedia_albums = get_studio_albums_from_wikipedia(artist_name)
+    
+    # Filtrar los álbumes para que solo aparezcan los de estudio que coinciden con los de Spotify
+    studio_album_names = [album['Title'] for album in wikipedia_albums]
+    filtered_albums = [album for album in albums if album['name'] in studio_album_names]
+    
+    # Mostrar los álbumes en Streamlit
+    album_names = [album['name'] for album in filtered_albums]
+    selected_album_name = st.selectbox("Selecciona un álbum:", album_names)
+    
+    selected_album = next(album for album in filtered_albums if album['name'] == selected_album_name)
+    tracks = get_album_tracks(selected_album['id'], token)
+    
+    # Mostrar las canciones del álbum seleccionado
+    track_names = [track['name'] for track in tracks]
+    selected_song_name = st.selectbox("Selecciona una canción:", track_names)
+    
+    selected_song = next(track for track in tracks if track['name'] == selected_song_name)
+    
+    # Obtener las letras de la canción seleccionada
+    lyrics = get_lyrics(selected_song['name'])
+    st.write("Letras de la canción:")
+    st.text_area("Letras", lyrics, height=300)
+    
+    # Mostrar análisis de las letras de la canción
+    st.write("Análisis de las letras de la canción:")
+    
+    song_length, word_freq = analyze_lyrics(lyrics)
 
-    if result.exists():
-        band_name = result.title
-        st.write(f"Se ha encontrado la página de {band_name}")
+    st.write(f"Longitud de la canción (en palabras): {song_length}")
 
-        band_url = get_discography_url(band_name)
-
-        if band_url:
-            st.write(f"Buscando álbumes de estudio de {band_name}...")
-            albums_df = get_studio_albums(band_url)
-
-            if albums_df is not None:
-                st.write(f"Álbumes de estudio de {band_name}:")
-                st.dataframe(albums_df)
-
-                # Paso 3: Elegir un álbum y explorar las canciones
-                album = st.selectbox("Selecciona un álbum:", albums_df['Title'].tolist())
-
-                # Obtener las canciones del álbum seleccionado
-                album_url = albums_df[albums_df['Title'] == album]['Link'].values[0]
-                songs = get_album_songs(album_url)
-
-                if songs:
-                    song = st.selectbox("Selecciona una canción:", songs)
-
-                    lyrics = get_song_lyrics(song, band_name)
-
-                    if lyrics:
-                        st.write(f"Letras de {song}:")
-                        st.text_area("Lyrics", lyrics, height=200)
-
-                        # Análisis de letras
-                        song_length, word_freq = analyze_lyrics(lyrics)
-                        st.write(f"Longitud de la canción (en palabras): {song_length}")
-
-                        # Gráficas
-                        st.subheader("Frecuencia de palabras")
-                        plot_word_frequency(word_freq)
-
-                        st.subheader("Nube de palabras")
-                        plot_wordcloud(word_freq)
-
-                        st.subheader("Análisis de Sentimiento")
-                        plot_sentiment(lyrics)
-
-                else:
-                    st.error("No se encontraron canciones para el álbum seleccionado.")
-            else:
-                st.error(f"No se pudo encontrar la sección de álbumes de estudio para {band_name}.")
-        else:
-            st.error("No se pudo generar la URL de la discografía.")
-    else:
-        st.error("No se encontraron resultados para la búsqueda.")
+    st.subheader("Frecuencia de palabras")
+    plot_word_frequency(word_freq)
+                        
+    st.subheader("Nube de palabras")
+    plot_wordcloud(word_freq)
+                        
+    st.subheader("Análisis de Sentimiento")
+    plot_sentiment(lyrics)
